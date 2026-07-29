@@ -1,0 +1,17 @@
+{
+  "name": "demo-recorder",
+  "version": "1.0.0",
+  "description": "Lightweight screen recorder with basic editing for SaaS product demos.",
+  "private": true,
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "msedge-tts": "^2.0.7"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}
