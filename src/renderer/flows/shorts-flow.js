@@ -27,6 +27,14 @@ export function startShortsFlow(container, { onExit }) {
   let globalVoiceId = null;
   let globalMusicTrackId = null;
   let globalMusicVolume = DEFAULT_MUSIC_VOLUME;
+  // Overlay has no dedicated UI of its own anymore -- it's chosen entirely
+  // through the Preview Modal's "Choose another overlay" button (see
+  // pickAndAssignOverlay), which still writes here for segment 1 (index 0)
+  // and to the segment's own fields for every other segment, exactly as
+  // before. These three just hold whatever was last picked.
+  let globalOverlayMode = 'builtin';
+  let globalOverlayId = null;
+  let globalCustomOverlay = null;
   let segments = [];
   let nextSegmentId = 1;
   let finalPreviewPath = null;
@@ -49,6 +57,7 @@ export function startShortsFlow(container, { onExit }) {
     options = await window.shortsAPI.getOptions();
     globalVoiceId = options.voices[0].id;
     globalMusicTrackId = options.musicTracks[0].id;
+    globalOverlayId = options.overlays[0].id;
     segments = [createSegment()];
 
     renderEdit();
@@ -62,6 +71,7 @@ export function startShortsFlow(container, { onExit }) {
       voiceId: options.voices[0].id,
       useCustomMusic: false,
       musicTrackId: options.musicTracks[0].id,
+      useCustomOverlay: false,
       overlayMode: 'builtin',
       overlayId: options.overlays[0].id,
       customOverlay: null,
@@ -88,6 +98,18 @@ export function startShortsFlow(container, { onExit }) {
     return segment.useCustomMusic ? segment.musicTrackId : globalMusicTrackId;
   }
 
+  function effectiveOverlayMode(segment) {
+    return segment.useCustomOverlay ? segment.overlayMode : globalOverlayMode;
+  }
+
+  function effectiveOverlayId(segment) {
+    return segment.useCustomOverlay ? segment.overlayId : globalOverlayId;
+  }
+
+  function effectiveCustomOverlay(segment) {
+    return segment.useCustomOverlay ? segment.customOverlay : globalCustomOverlay;
+  }
+
   // --- The single render path. Both manual Preview and the Generate Final
   // Video auto-render step call this and only this -- there is no second
   // way to turn a segment's script into a rendered clip.
@@ -97,14 +119,24 @@ export function startShortsFlow(container, { onExit }) {
     segment.previewError = null;
     segment.approved = false;
 
+    // Validated up front rather than letting it fail deep in ffmpeg: mode
+    // can end up 'custom' with no file selected yet (e.g. from an older
+    // session), which previously produced a confusing "Unknown overlay:
+    // null" error at generation time instead of a clear, actionable one.
+    if (effectiveOverlayMode(segment) === 'custom' && !effectiveCustomOverlay(segment)) {
+      segment.previewStatus = 'error';
+      segment.previewError = 'No overlay file is selected. Use Preview, then "Choose another overlay" to pick one.';
+      return false;
+    }
+
     try {
       const result = await window.shortsAPI.generate({
         scriptText: segment.scriptText.trim(),
         voiceId: effectiveVoiceId(segment),
         musicTrackId: effectiveMusicTrackId(segment),
         musicVolume: globalMusicVolume,
-        overlayId: segment.overlayMode === 'builtin' ? segment.overlayId : null,
-        customOverlay: segment.overlayMode === 'custom' ? segment.customOverlay : null,
+        overlayId: effectiveOverlayMode(segment) === 'builtin' ? effectiveOverlayId(segment) : null,
+        customOverlay: effectiveOverlayMode(segment) === 'custom' ? effectiveCustomOverlay(segment) : null,
       });
       segment.previewStatus = 'ready';
       segment.previewPath = result.outputPath;
@@ -116,19 +148,31 @@ export function startShortsFlow(container, { onExit }) {
     }
   }
 
-  // Shared by the segment card's "Browse…/Change Overlay" button and the
-  // Preview Modal's "Choose another overlay" button -- the exact same
-  // window.shortsAPI.pickOverlay() call and result handling either way.
+  // Backs the Preview Modal's "Choose another overlay" button -- the only
+  // place overlay is ever chosen (see the note on globalOverlayMode above).
+  // Segment 1 (index 0) has no override of its own, so picking there
+  // updates the global default instead; every other segment gets its own.
   async function pickAndAssignOverlay(segment, { switchToCustomMode }) {
     const result = await window.shortsAPI.pickOverlay();
     if (result.canceled) return false;
-    segment.customOverlay = { filePath: result.filePath, fileType: result.fileType };
-    if (switchToCustomMode) segment.overlayMode = 'custom';
-    invalidateSegment(segment);
+
+    const customOverlay = { filePath: result.filePath, fileType: result.fileType };
+
+    if (segments.indexOf(segment) === 0) {
+      globalCustomOverlay = customOverlay;
+      if (switchToCustomMode) globalOverlayMode = 'custom';
+      segments.forEach((s) => { if (!s.useCustomOverlay) invalidateSegment(s); });
+    } else {
+      segment.customOverlay = customOverlay;
+      if (switchToCustomMode) segment.overlayMode = 'custom';
+      segment.useCustomOverlay = true;
+      invalidateSegment(segment);
+    }
+
     return true;
   }
 
-  // --- Edit screen: global defaults + the segment list ---
+  // --- Edit screen: the segment list ---
 
   function renderEdit() {
     appEl.innerHTML = '';
@@ -143,52 +187,6 @@ export function startShortsFlow(container, { onExit }) {
 
     const form = document.createElement('div');
     form.className = 'shorts-form';
-
-    const globalPanel = document.createElement('div');
-    globalPanel.className = 'shorts-global-panel';
-
-    const globalHeading = document.createElement('p');
-    globalHeading.className = 'shorts-section-heading';
-    globalHeading.textContent = 'Project Defaults';
-    globalPanel.appendChild(globalHeading);
-
-    const globalRow = document.createElement('div');
-    globalRow.className = 'shorts-global-row';
-
-    globalRow.appendChild(buildSelectField({
-      label: 'Voice',
-      options: options.voices,
-      value: globalVoiceId,
-      onChange: (value) => {
-        globalVoiceId = value;
-        segments.forEach((segment) => { if (!segment.useCustomVoice) invalidateSegment(segment); });
-        renderEdit();
-      },
-    }));
-
-    globalRow.appendChild(buildSelectField({
-      label: 'Music',
-      options: options.musicTracks,
-      value: globalMusicTrackId,
-      onChange: (value) => {
-        globalMusicTrackId = value;
-        segments.forEach((segment) => { if (!segment.useCustomMusic) invalidateSegment(segment); });
-        renderEdit();
-      },
-    }));
-
-    globalPanel.appendChild(globalRow);
-
-    globalPanel.appendChild(buildVolumeSlider({
-      label: 'Music Volume',
-      value: globalMusicVolume,
-      onChange: (value) => {
-        globalMusicVolume = value;
-        segments.forEach(invalidateSegment);
-      },
-    }));
-
-    form.appendChild(globalPanel);
 
     const segmentsHeading = document.createElement('p');
     segmentsHeading.className = 'shorts-section-heading';
@@ -216,9 +214,15 @@ export function startShortsFlow(container, { onExit }) {
   // --- One segment card ---
 
   function buildSegmentCard(segment, index) {
+    const hasAcceptedPreview = segment.approved && Boolean(segment.previewPath);
+
     const card = document.createElement('div');
     card.className = 'shorts-segment-card';
 
+    // A single compact row: title, Voice, Music, status, then the action
+    // icons -- no more grouping/splitting into left/right clusters, so it
+    // reads as one continuous line (wraps only if the window is too narrow
+    // to fit it).
     const header = document.createElement('div');
     header.className = 'shorts-segment-header';
 
@@ -227,14 +231,45 @@ export function startShortsFlow(container, { onExit }) {
     title.textContent = `Segment ${index + 1}`;
     header.appendChild(title);
 
-    const headerRight = document.createElement('div');
-    headerRight.className = 'shorts-segment-header-right';
+    // Voice and Music are the options changed most often, so they get their
+    // own always-visible dropdowns right in the header -- each is a direct,
+    // per-segment choice (not just this segment's global-following
+    // display): picking a value here always pins it to this segment
+    // specifically and only invalidates this segment's own preview, never
+    // any other segment's.
+    header.appendChild(buildHeaderSelect({
+      options: options.voices,
+      value: effectiveVoiceId(segment),
+      ariaLabel: 'Voice',
+      onChange: (value) => {
+        segment.useCustomVoice = true;
+        segment.voiceId = value;
+        invalidateSegment(segment);
+        renderEdit();
+      },
+    }));
+
+    header.appendChild(buildHeaderSelect({
+      options: options.musicTracks,
+      value: effectiveMusicTrackId(segment),
+      ariaLabel: 'Music',
+      onChange: (value) => {
+        segment.useCustomMusic = true;
+        segment.musicTrackId = value;
+        invalidateSegment(segment);
+        renderEdit();
+      },
+    }));
 
     const statusBadge = document.createElement('span');
     statusBadge.className = `shorts-segment-status shorts-segment-status-${segment.previewStatus === 'ready' && segment.approved ? 'approved' : segment.previewStatus}`;
     statusBadge.textContent = segmentStatusLabel(segment);
-    headerRight.appendChild(statusBadge);
+    header.appendChild(statusBadge);
 
+    // Just 3 icons now -- Preview / Insert below / Remove. Overlay is
+    // chosen entirely through Preview (see pickAndAssignOverlay); Music
+    // Volume moved to above the accepted-preview video (see
+    // buildAcceptedPreviewDisplay), the one moment it's actually useful.
     const controls = document.createElement('div');
     controls.className = 'shorts-segment-controls';
 
@@ -270,18 +305,30 @@ export function startShortsFlow(container, { onExit }) {
     });
     controls.appendChild(removeBtn);
 
-    headerRight.appendChild(controls);
-    header.appendChild(headerRight);
+    header.appendChild(controls);
     card.appendChild(header);
+
+    // Script + accepted Preview live side by side only once this segment
+    // has an ACCEPTED preview -- reviewing always happens in the Preview
+    // Modal first; only clicking Accept there moves the result beside the
+    // script. Both columns are always in the DOM; only a class toggle (see
+    // splitRow below) hides the preview column and lets the script column
+    // take full width, so the <textarea> node never moves/steals focus
+    // while typing.
+    const splitRow = document.createElement('div');
+    splitRow.className = 'shorts-segment-split';
+
+    const scriptCol = document.createElement('div');
+    scriptCol.className = 'shorts-segment-script-col';
 
     const scriptLabel = document.createElement('label');
     scriptLabel.className = 'shorts-field-label';
     scriptLabel.textContent = 'Script';
-    card.appendChild(scriptLabel);
+    scriptCol.appendChild(scriptLabel);
 
     const scriptInput = document.createElement('textarea');
     scriptInput.className = 'shorts-script-input';
-    scriptInput.placeholder = 'Introducing our new dashboard...';
+    scriptInput.placeholder = 'Write your script here...';
     scriptInput.value = segment.scriptText;
     scriptInput.rows = 4;
     scriptInput.addEventListener('input', () => {
@@ -290,19 +337,60 @@ export function startShortsFlow(container, { onExit }) {
       statusBadge.className = `shorts-segment-status shorts-segment-status-${segment.previewStatus}`;
       statusBadge.textContent = segmentStatusLabel(segment);
       previewBtn.disabled = segment.scriptText.trim().length === 0;
+      splitRow.classList.add('shorts-segment-split-collapsed');
+      previewCol.innerHTML = '';
       generateFinalRefreshHook();
     });
-    card.appendChild(scriptInput);
+    scriptCol.appendChild(scriptInput);
 
-    card.appendChild(buildSegmentOptions(segment));
-
-    if (segment.previewStatus === 'error') {
-      const errorEl = document.createElement('p');
-      errorEl.textContent = segment.previewError;
-      card.appendChild(errorEl);
+    const previewCol = document.createElement('div');
+    previewCol.className = 'shorts-segment-preview-col';
+    if (hasAcceptedPreview) {
+      previewCol.appendChild(buildAcceptedPreviewDisplay(segment));
+    } else {
+      splitRow.classList.add('shorts-segment-split-collapsed');
     }
 
+    splitRow.appendChild(scriptCol);
+    splitRow.appendChild(previewCol);
+    card.appendChild(splitRow);
+
     return card;
+  }
+
+  // Read-only display for the split layout's preview column -- shown only
+  // once a segment's preview has been Accepted in the modal. No actions
+  // here besides Music Volume; Accept/Cancel/Choose another overlay all
+  // happen in the modal, during review, before acceptance. Deliberately a
+  // plain, compact video (not the full phone-frame chrome used by the
+  // modal/final-preview screens) so its height roughly matches the script
+  // textarea beside it -- a full-size phone frame would dominate the row.
+  //
+  // Music Volume lives here, above the video, rather than anywhere else in
+  // the UI: this is the one moment it's actually useful -- the user is
+  // listening to a real rendered clip and can judge the narration/music
+  // balance directly. It's still a single project-wide value (not
+  // per-segment), so dragging it invalidates every segment's preview, not
+  // just this one -- same as when it lived in Settings, just relocated.
+  function buildAcceptedPreviewDisplay(segment) {
+    const wrap = document.createElement('div');
+    wrap.className = 'shorts-accepted-preview';
+
+    wrap.appendChild(buildVolumeSlider({
+      label: 'Music Volume',
+      value: globalMusicVolume,
+      onChange: (value) => {
+        globalMusicVolume = value;
+        segments.forEach(invalidateSegment);
+      },
+    }));
+
+    const video = document.createElement('video');
+    video.src = `file://${segment.previewPath}`;
+    video.controls = true;
+    wrap.appendChild(video);
+
+    return wrap;
   }
 
   function segmentStatusLabel(segment) {
@@ -313,203 +401,13 @@ export function startShortsFlow(container, { onExit }) {
     return 'Not previewed';
   }
 
-  // Voice/Music overrides and the Overlay picker live in a collapsed-by-
-  // default disclosure so a default segment stays compact -- it only opens
-  // automatically when an override is already active.
-  function buildSegmentOptions(segment) {
-    const details = document.createElement('details');
-    details.className = 'shorts-segment-options';
-    details.open = segment.optionsExpanded
-      || segment.useCustomVoice
-      || segment.useCustomMusic
-      || segment.overlayMode === 'custom';
-    details.addEventListener('toggle', () => {
-      segment.optionsExpanded = details.open;
-    });
-
-    const summary = document.createElement('summary');
-    summary.textContent = 'Options';
-    details.appendChild(summary);
-
-    const body = document.createElement('div');
-    body.className = 'shorts-segment-options-body';
-    body.appendChild(buildVoiceOverrideField(segment));
-    body.appendChild(buildMusicOverrideField(segment));
-    body.appendChild(buildSegmentOverlayField(segment));
-    details.appendChild(body);
-
-    return details;
-  }
-
-  function buildVoiceOverrideField(segment) {
-    const wrap = document.createElement('div');
-
-    const checkboxRow = document.createElement('label');
-    checkboxRow.className = 'checkbox-row';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.checked = segment.useCustomVoice;
-    checkbox.addEventListener('change', () => {
-      segment.useCustomVoice = checkbox.checked;
-      invalidateSegment(segment);
-      renderEdit();
-    });
-    checkboxRow.appendChild(checkbox);
-    checkboxRow.appendChild(document.createTextNode('Use a different voice for this segment'));
-    wrap.appendChild(checkboxRow);
-
-    if (segment.useCustomVoice) {
-      wrap.appendChild(buildSelectField({
-        label: 'Segment Voice',
-        options: options.voices,
-        value: segment.voiceId,
-        onChange: (value) => {
-          segment.voiceId = value;
-          invalidateSegment(segment);
-        },
-      }));
-    }
-
-    return wrap;
-  }
-
-  function buildMusicOverrideField(segment) {
-    const wrap = document.createElement('div');
-
-    const checkboxRow = document.createElement('label');
-    checkboxRow.className = 'checkbox-row';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.checked = segment.useCustomMusic;
-    checkbox.addEventListener('change', () => {
-      segment.useCustomMusic = checkbox.checked;
-      invalidateSegment(segment);
-      renderEdit();
-    });
-    checkboxRow.appendChild(checkbox);
-    checkboxRow.appendChild(document.createTextNode('Use different music for this segment'));
-    wrap.appendChild(checkboxRow);
-
-    if (segment.useCustomMusic) {
-      wrap.appendChild(buildSelectField({
-        label: 'Segment Music',
-        options: options.musicTracks,
-        value: segment.musicTrackId,
-        onChange: (value) => {
-          segment.musicTrackId = value;
-          invalidateSegment(segment);
-        },
-      }));
-    }
-
-    return wrap;
-  }
-
-  // --- Per-segment overlay picker (Built-in Library / Choose from my PC) ---
-
-  function buildSegmentOverlayField(segment) {
-    const wrap = document.createElement('div');
-    wrap.className = 'shorts-select-field';
-
-    const labelEl = document.createElement('label');
-    labelEl.className = 'shorts-field-label';
-    labelEl.textContent = 'Overlay';
-    wrap.appendChild(labelEl);
-
-    const radioGroup = document.createElement('div');
-    radioGroup.className = 'shorts-radio-group';
-    radioGroup.appendChild(buildOverlayModeRadio(segment, 'Built-in Library', 'builtin'));
-    radioGroup.appendChild(buildOverlayModeRadio(segment, 'Choose from my PC', 'custom'));
-    wrap.appendChild(radioGroup);
-
-    if (segment.overlayMode === 'builtin') {
-      const select = document.createElement('select');
-      select.className = 'shorts-select';
-      options.overlays.forEach((choice) => {
-        const opt = document.createElement('option');
-        opt.value = choice.id;
-        opt.textContent = choice.label;
-        opt.selected = choice.id === segment.overlayId;
-        select.appendChild(opt);
-      });
-      select.addEventListener('change', () => {
-        segment.overlayId = select.value;
-        invalidateSegment(segment);
-      });
-      wrap.appendChild(select);
-    } else {
-      wrap.appendChild(buildCustomOverlayPicker(segment));
-    }
-
-    return wrap;
-  }
-
-  function buildOverlayModeRadio(segment, labelText, mode) {
-    const label = document.createElement('label');
-    label.className = 'radio-row';
-
-    const input = document.createElement('input');
-    input.type = 'radio';
-    input.name = `shorts-overlay-mode-${segment.id}`;
-    input.value = mode;
-    input.checked = segment.overlayMode === mode;
-    input.addEventListener('change', () => {
-      segment.overlayMode = mode;
-      invalidateSegment(segment);
-      renderEdit();
-    });
-
-    label.appendChild(input);
-    label.appendChild(document.createTextNode(labelText));
-    return label;
-  }
-
-  function buildCustomOverlayPicker(segment) {
-    const wrap = document.createElement('div');
-    wrap.className = 'shorts-custom-overlay';
-
-    if (segment.customOverlay) {
-      const preview = document.createElement(segment.customOverlay.fileType === 'image' ? 'img' : 'video');
-      preview.className = 'shorts-overlay-preview';
-      preview.src = `file://${segment.customOverlay.filePath}`;
-      if (segment.customOverlay.fileType === 'video') {
-        preview.controls = true;
-        preview.muted = true;
-      }
-      wrap.appendChild(preview);
-
-      const fileNameEl = document.createElement('p');
-      fileNameEl.className = 'shorts-overlay-filename';
-      fileNameEl.textContent = segment.customOverlay.filePath.split(/[\\/]/).pop();
-      wrap.appendChild(fileNameEl);
-    }
-
-    const browseBtn = document.createElement('button');
-    browseBtn.type = 'button';
-    browseBtn.className = 'btn btn-secondary';
-    browseBtn.textContent = segment.customOverlay ? 'Change Overlay' : 'Browse…';
-    browseBtn.addEventListener('click', async () => {
-      const picked = await pickAndAssignOverlay(segment, { switchToCustomMode: false });
-      if (picked) renderEdit();
-    });
-    wrap.appendChild(browseBtn);
-
-    return wrap;
-  }
-
   // --- Shared field builders ---
 
-  function buildSelectField({ label, options: choices, value, onChange }) {
-    const wrap = document.createElement('div');
-    wrap.className = 'shorts-select-field';
-
-    const labelEl = document.createElement('label');
-    labelEl.className = 'shorts-field-label';
-    labelEl.textContent = label;
-    wrap.appendChild(labelEl);
-
+  // Compact, label-less select for the segment header (Voice/Music).
+  function buildHeaderSelect({ options: choices, value, onChange, ariaLabel }) {
     const select = document.createElement('select');
-    select.className = 'shorts-select';
+    select.className = 'shorts-select shorts-header-select';
+    select.setAttribute('aria-label', ariaLabel);
     choices.forEach((choice) => {
       const opt = document.createElement('option');
       opt.value = choice.id;
@@ -518,9 +416,7 @@ export function startShortsFlow(container, { onExit }) {
       select.appendChild(opt);
     });
     select.addEventListener('change', () => onChange(select.value));
-    wrap.appendChild(select);
-
-    return wrap;
+    return select;
   }
 
   function buildVolumeSlider({ label, value, onChange }) {
@@ -556,8 +452,8 @@ export function startShortsFlow(container, { onExit }) {
     if (btn) btn.disabled = !segments.every((segment) => segment.scriptText.trim().length > 0);
   }
 
-  // --- Shared phone-frame video display, used by the Preview Modal and the
-  // final-video preview screen. ---
+  // --- Shared phone-frame video display, used by the accepted-preview
+  // column, the Preview Modal, and the final-video preview screen. ---
 
   function buildPhoneFrame(videoSrc, extraClass) {
     const phoneFrame = document.createElement('div');
@@ -589,7 +485,10 @@ export function startShortsFlow(container, { onExit }) {
   // generating/ready/error state driven entirely by segment.previewStatus,
   // with Accept / Cancel / Choose another overlay together once ready --
   // all three reuse existing functions (renderSegmentClip, invalidateSegment,
-  // pickAndAssignOverlay), nothing new is rendered here.
+  // pickAndAssignOverlay), nothing new is rendered here. Only once Accept is
+  // clicked does the result move into the segment's own column beside the
+  // script (see buildSegmentCard's splitRow) -- reviewing always happens
+  // here first.
   //
   // Deliberately appended as a sibling of appEl (not inside it): renderEdit()
   // calls appEl.innerHTML = '' from several unrelated interactions (voice/
@@ -605,6 +504,24 @@ export function startShortsFlow(container, { onExit }) {
       renderEdit();
       if (modalSegment === segment) renderModalBody();
     });
+  }
+
+  // Picking a new overlay from inside the modal must NOT close it -- the
+  // old preview belonged to the previous overlay, so it re-renders in
+  // place (generating -> ready/error) and the user keeps reviewing in the
+  // same modal, exactly like the initial Preview click, just without the
+  // open/close bookend.
+  async function handleChooseAnotherOverlayInModal(segment) {
+    const picked = await pickAndAssignOverlay(segment, { switchToCustomMode: true });
+    if (!picked) return;
+
+    const pending = renderSegmentClip(segment);
+    renderEdit();
+    renderModalBody();
+
+    await pending;
+    renderEdit();
+    if (modalSegment === segment) renderModalBody();
   }
 
   function openSegmentPreviewModal(segment) {
@@ -730,13 +647,7 @@ export function startShortsFlow(container, { onExit }) {
     overlayBtn.type = 'button';
     overlayBtn.className = 'btn btn-secondary';
     overlayBtn.textContent = 'Choose another overlay';
-    overlayBtn.addEventListener('click', async () => {
-      const picked = await pickAndAssignOverlay(segment, { switchToCustomMode: true });
-      if (picked) {
-        closeSegmentPreviewModal();
-        renderEdit();
-      }
-    });
+    overlayBtn.addEventListener('click', () => handleChooseAnotherOverlayInModal(segment));
     actions.appendChild(overlayBtn);
 
     const cancelBtn = document.createElement('button');

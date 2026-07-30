@@ -1,4 +1,4 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, Menu } = require('electron');
 const path = require('path');
 const { registerRecordingHandlers } = require('./ipc/recording.ipc');
 const { registerExportHandlers } = require('./ipc/export.ipc');
@@ -18,6 +18,23 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
     },
+  });
+
+  // Vanilla BrowserWindows have no built-in context menu at all -- right-
+  // click does nothing until one is wired up explicitly. Scoped to editable
+  // fields only (textareas/inputs), using Electron's built-in roles so Cut/
+  // Copy/Paste/Select All are correctly enabled/disabled based on selection
+  // and clipboard state -- this is the native menu, not a custom one.
+  win.webContents.on('context-menu', (event, params) => {
+    if (!params.isEditable) return;
+
+    Menu.buildFromTemplate([
+      { role: 'cut' },
+      { role: 'copy' },
+      { role: 'paste' },
+      { type: 'separator' },
+      { role: 'selectAll' },
+    ]).popup({ window: win });
   });
 
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
